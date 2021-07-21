@@ -38,6 +38,9 @@ entry_val: ?u64 = null,
 
 got_len: u64 = 0,
 
+managed_decl_blocks: std.ArrayListUnmanaged(DeclBlock) = .{},
+decl_block_map: std.AutoHashMapUnmanaged(*const Module.Decl, u32) = .{},
+
 const Bases = struct {
     text: u64,
     /// the Global Offset Table starts at the beginning of the data section
@@ -180,20 +183,22 @@ fn updateFinish(self: *Plan9, decl: *Module.Decl) !void {
     log.debug("update the symbol table and got for decl {*} ({s})", .{ decl, decl.name });
     const sym_t: aout.Sym.Type = if (is_fn) .t else .d;
     // write the internal linker metadata
-    decl.link.plan9.type = sym_t;
+    const block_index = self.decl_block_map.get(decl) orelse unreachable;
+    const block = &self.managed_decl_blocks.items[block_index];
+    block.type = sym_t;
     // write the symbol
     // we already have the got index because that got allocated in allocateDeclIndexes
     const sym: aout.Sym = .{
         .value = undefined, // the value of stuff gets filled in in flushModule
-        .type = decl.link.plan9.type,
+        .type = block.type,
         .name = mem.span(decl.name),
     };
 
-    if (decl.link.plan9.sym_index) |s| {
+    if (block.sym_index) |s| {
         self.syms.items[s] = sym;
     } else {
         try self.syms.append(self.base.allocator, sym);
-        decl.link.plan9.sym_index = self.syms.items.len - 1;
+        block.sym_index = self.syms.items.len - 1;
     }
 }
 
@@ -249,20 +254,22 @@ pub fn flushModule(self: *Plan9, comp: *Compilation) !void {
         while (it.next()) |entry| {
             const decl = entry.key_ptr.*;
             const code = entry.value_ptr.*;
+            const block_index = self.decl_block_map.get(decl) orelse unreachable;
+            const block = &self.managed_decl_blocks.items[block_index];
             log.debug("write text decl {*} ({s})", .{ decl, decl.name });
             foff += code.len;
             iovecs[iovecs_i] = .{ .iov_base = code.ptr, .iov_len = code.len };
             iovecs_i += 1;
             const off = self.getAddr(text_i, .t);
             text_i += code.len;
-            decl.link.plan9.offset = off;
+            block.offset = off;
             if (!self.sixtyfour_bit) {
-                mem.writeIntNative(u32, got_table[decl.link.plan9.got_index.? * 4 ..][0..4], @intCast(u32, off));
-                mem.writeInt(u32, got_table[decl.link.plan9.got_index.? * 4 ..][0..4], @intCast(u32, off), self.base.options.target.cpu.arch.endian());
+                mem.writeIntNative(u32, got_table[block.got_index.? * 4 ..][0..4], @intCast(u32, off));
+                mem.writeInt(u32, got_table[block.got_index.? * 4 ..][0..4], @intCast(u32, off), self.base.options.target.cpu.arch.endian());
             } else {
-                mem.writeInt(u64, got_table[decl.link.plan9.got_index.? * 8 ..][0..8], off, self.base.options.target.cpu.arch.endian());
+                mem.writeInt(u64, got_table[block.got_index.? * 8 ..][0..8], off, self.base.options.target.cpu.arch.endian());
             }
-            self.syms.items[decl.link.plan9.sym_index.?].value = off;
+            self.syms.items[block.sym_index.?].value = off;
             if (mod.decl_exports.get(decl)) |exports| {
                 try self.addDeclExports(mod, decl, exports);
             }
@@ -280,6 +287,8 @@ pub fn flushModule(self: *Plan9, comp: *Compilation) !void {
         while (it.next()) |entry| {
             const decl = entry.key_ptr.*;
             const code = entry.value_ptr.*;
+            const block_index = self.decl_block_map.get(decl) orelse unreachable;
+            const block = &self.managed_decl_blocks.items[block_index];
             log.debug("write data decl {*} ({s})", .{ decl, decl.name });
 
             foff += code.len;
@@ -287,13 +296,13 @@ pub fn flushModule(self: *Plan9, comp: *Compilation) !void {
             iovecs_i += 1;
             const off = self.getAddr(data_i, .d);
             data_i += code.len;
-            decl.link.plan9.offset = off;
+            block.offset = off;
             if (!self.sixtyfour_bit) {
-                mem.writeInt(u32, got_table[decl.link.plan9.got_index.? * 4 ..][0..4], @intCast(u32, off), self.base.options.target.cpu.arch.endian());
+                mem.writeInt(u32, got_table[block.got_index.? * 4 ..][0..4], @intCast(u32, off), self.base.options.target.cpu.arch.endian());
             } else {
-                mem.writeInt(u64, got_table[decl.link.plan9.got_index.? * 8 ..][0..8], off, self.base.options.target.cpu.arch.endian());
+                mem.writeInt(u64, got_table[block.got_index.? * 8 ..][0..8], off, self.base.options.target.cpu.arch.endian());
             }
-            self.syms.items[decl.link.plan9.sym_index.?].value = off;
+            self.syms.items[block.sym_index.?].value = off;
             if (mod.decl_exports.get(decl)) |exports| {
                 try self.addDeclExports(mod, decl, exports);
             }
@@ -342,9 +351,11 @@ fn addDeclExports(
                 break;
             }
         }
+        const block_index = self.decl_block_map.get(decl) orelse unreachable;
+        const block = self.managed_decl_blocks.items[block_index];
         const sym = .{
-            .value = decl.link.plan9.offset.?,
-            .type = decl.link.plan9.type.toGlobal(),
+            .value = block.offset.?,
+            .type = block.type.toGlobal(),
             .name = exp.options.name,
         };
 
@@ -389,6 +400,9 @@ pub fn deinit(self: *Plan9) void {
     }
     self.data_decl_table.deinit(self.base.allocator);
     self.syms.deinit(self.base.allocator);
+
+    self.managed_decl_blocks.deinit(self.base.allocator);
+    self.decl_block_map.deinit(self.base.allocator);
 }
 
 pub const Export = ?usize;
@@ -451,8 +465,25 @@ pub fn writeSyms(self: *Plan9, buf: *std.ArrayList(u8)) !void {
 }
 
 pub fn allocateDeclIndexes(self: *Plan9, decl: *Module.Decl) !void {
-    if (decl.link.plan9.got_index == null) {
+    const block: *DeclBlock = blk: {
+        if (self.decl_block_map.get(decl)) |index| {
+            break :blk &self.managed_decl_blocks.items[index];
+        }
+
+        const block_index = @intCast(u32, self.managed_decl_blocks.items.len);
+        const block = try self.managed_decl_blocks.addOne(self.base.allocator);
+        block.* = DeclBlock.empty;
+        try self.decl_block_map.putNoClobber(self.base.allocator, decl, block_index);
+        break :blk block;
+    };
+    if (block.got_index == null) {
         self.got_len += 1;
-        decl.link.plan9.got_index = self.got_len - 1;
+        block.got_index = self.got_len - 1;
     }
+}
+
+pub fn getDeclOffsetTableVAddr(self: *Plan9, decl: *const Module.Decl, ptr_bytes: u64) u64 {
+    const block_index = self.decl_block_map.get(decl) orelse unreachable;
+    const block = self.managed_decl_blocks.items[block_index];
+    return self.bases.data + block.got_index.? * ptr_bytes;
 }

@@ -100,6 +100,9 @@ debug_line_header_dirty: bool = false,
 
 error_flags: File.ErrorFlags = File.ErrorFlags{},
 
+managed_text_blocks: std.ArrayListUnmanaged(TextBlock) = .{},
+decl_text_block_map: std.AutoHashMapUnmanaged(*const Module.Decl, u32) = .{},
+
 /// A list of text blocks that have surplus capacity. This list can have false
 /// positives, as functions grow and shrink over time, only sometimes being added
 /// or removed from the freelist.
@@ -115,8 +118,8 @@ error_flags: File.ErrorFlags = File.ErrorFlags{},
 /// overcapacity can be negative. A simple way to have negative overcapacity is to
 /// allocate a fresh text block, which will have ideal capacity, and then grow it
 /// by 1 byte. It will then have -1 overcapacity.
-text_block_free_list: std.ArrayListUnmanaged(*TextBlock) = .{},
-last_text_block: ?*TextBlock = null,
+text_block_free_list: std.ArrayListUnmanaged(u32) = .{},
+last_text_block: ?u32 = null,
 
 /// A list of `SrcFn` whose Line Number Programs have surplus capacity.
 /// This is the same concept as `text_block_free_list`; see those doc comments.
@@ -126,9 +129,9 @@ dbg_line_fn_last: ?*SrcFn = null,
 
 /// A list of `TextBlock` whose corresponding .debug_info tags have surplus capacity.
 /// This is the same concept as `text_block_free_list`; see those doc comments.
-dbg_info_decl_free_list: std.AutoHashMapUnmanaged(*TextBlock, void) = .{},
-dbg_info_decl_first: ?*TextBlock = null,
-dbg_info_decl_last: ?*TextBlock = null,
+dbg_info_decl_free_list: std.AutoHashMapUnmanaged(u32, void) = .{},
+dbg_info_decl_first: ?u32 = null,
+dbg_info_decl_last: ?u32 = null,
 
 /// When allocating, the ideal_capacity is calculated by
 /// actual_capacity + (actual_capacity / ideal_factor)
@@ -154,13 +157,13 @@ pub const TextBlock = struct {
     offset_table_index: u32,
     /// Points to the previous and next neighbors, based on the `text_offset`.
     /// This can be used to find, for example, the capacity of this `TextBlock`.
-    prev: ?*TextBlock,
-    next: ?*TextBlock,
+    prev: ?u32,
+    next: ?u32,
 
     /// Previous/next linked list pointers.
     /// This is the linked list node for this Decl's corresponding .debug_info tag.
-    dbg_info_prev: ?*TextBlock,
-    dbg_info_next: ?*TextBlock,
+    dbg_info_prev: ?u32,
+    dbg_info_next: ?u32,
     /// Offset into .debug_info pointing to the tag for this Decl.
     dbg_info_off: u32,
     /// Size of the .debug_info tag for this Decl, not including padding.
@@ -183,7 +186,8 @@ pub const TextBlock = struct {
     fn capacity(self: TextBlock, elf_file: Elf) u64 {
         const self_sym = elf_file.local_symbols.items[self.local_sym_index];
         if (self.next) |next| {
-            const next_sym = elf_file.local_symbols.items[next.local_sym_index];
+            const next_block = elf_file.managed_text_blocks.items[next];
+            const next_sym = elf_file.local_symbols.items[next_block.local_sym_index];
             return next_sym.st_value - self_sym.st_value;
         } else {
             // We are the last block. The capacity is limited only by virtual address space.
@@ -194,8 +198,9 @@ pub const TextBlock = struct {
     fn freeListEligible(self: TextBlock, elf_file: Elf) bool {
         // No need to keep a free list node for the last block.
         const next = self.next orelse return false;
+        const next_block = elf_file.managed_text_blocks.items[next];
         const self_sym = elf_file.local_symbols.items[self.local_sym_index];
-        const next_sym = elf_file.local_symbols.items[next.local_sym_index];
+        const next_sym = elf_file.local_symbols.items[next_block.local_sym_index];
         const cap = next_sym.st_value - self_sym.st_value;
         const ideal_cap = padToIdeal(self_sym.st_size);
         if (cap <= ideal_cap) return false;
@@ -314,16 +319,29 @@ pub fn deinit(self: *Elf) void {
     self.global_symbol_free_list.deinit(self.base.allocator);
     self.local_symbol_free_list.deinit(self.base.allocator);
     self.offset_table_free_list.deinit(self.base.allocator);
-    self.text_block_free_list.deinit(self.base.allocator);
     self.dbg_line_fn_free_list.deinit(self.base.allocator);
     self.dbg_info_decl_free_list.deinit(self.base.allocator);
     self.offset_table.deinit(self.base.allocator);
+
+    self.managed_text_blocks.deinit(self.base.allocator);
+    self.decl_text_block_map.deinit(self.base.allocator);
+    self.text_block_free_list.deinit(self.base.allocator);
 }
 
 pub fn getDeclVAddr(self: *Elf, decl: *const Module.Decl) u64 {
     assert(self.llvm_object == null);
-    assert(decl.link.elf.local_sym_index != 0);
-    return self.local_symbols.items[decl.link.elf.local_sym_index].st_value;
+    const text_block_index = self.decl_text_block_map.get(decl) orelse unreachable;
+    const text_block = self.managed_text_blocks.items[text_block_index];
+    assert(text_block.local_sym_index != 0);
+    return self.local_symbols.items[text_block.local_sym_index].st_value;
+}
+
+pub fn getDeclOffsetTableVAddr(self: *Elf, decl: *const Module.Decl, ptr_bytes: u64) u64 {
+    assert(self.llvm_object == null);
+    const text_block_index = self.decl_text_block_map.get(decl) orelse unreachable;
+    const text_block = self.managed_text_blocks.items[text_block_index];
+    const got = self.program_headers.items[self.phdr_got_index.?];
+    return got.p_vaddr + text_block.offset_table_index * ptr_bytes;
 }
 
 fn getDebugLineProgramOff(self: Elf) u32 {
@@ -848,7 +866,9 @@ pub fn flushModule(self: *Elf, comp: *Compilation) !void {
         // If this value is null it means there is an error in the module;
         // leave debug_info_header_dirty=true.
         const first_dbg_info_decl = self.dbg_info_decl_first orelse break :debug_info;
+        const first_dbg_info_decl_block = self.managed_text_blocks.items[first_dbg_info_decl];
         const last_dbg_info_decl = self.dbg_info_decl_last.?;
+        const last_dbg_info_decl_block = self.managed_text_blocks.items[last_dbg_info_decl];
         const debug_info_sect = &self.sections.items[self.debug_info_section_index.?];
 
         var di_buf = std.ArrayList(u8).init(self.base.allocator);
@@ -863,7 +883,7 @@ pub fn flushModule(self: *Elf, comp: *Compilation) !void {
         // We have to come back and write it later after we know the size.
         const after_init_len = di_buf.items.len + init_len_size;
         // +1 for the final 0 that ends the compilation unit children.
-        const dbg_info_end = last_dbg_info_decl.dbg_info_off + last_dbg_info_decl.dbg_info_len + 1;
+        const dbg_info_end = last_dbg_info_decl_block.dbg_info_off + last_dbg_info_decl_block.dbg_info_len + 1;
         const init_len = dbg_info_end - after_init_len;
         switch (self.ptr_width) {
             .p32 => {
@@ -908,11 +928,11 @@ pub fn flushModule(self: *Elf, comp: *Compilation) !void {
         // Until then we say it is C99.
         mem.writeInt(u16, di_buf.addManyAsArrayAssumeCapacity(2), DW.LANG_C99, target_endian);
 
-        if (di_buf.items.len > first_dbg_info_decl.dbg_info_off) {
+        if (di_buf.items.len > first_dbg_info_decl_block.dbg_info_off) {
             // Move the first N decls to the end to make more padding for the header.
             @panic("TODO: handle .debug_info header exceeding its padding");
         }
-        const jmp_amt = first_dbg_info_decl.dbg_info_off - di_buf.items.len;
+        const jmp_amt = first_dbg_info_decl_block.dbg_info_off - di_buf.items.len;
         try self.pwriteDbgInfoNops(0, di_buf.items, jmp_amt, false, debug_info_sect.sh_offset);
         self.debug_info_header_dirty = false;
     }
@@ -1881,13 +1901,14 @@ fn writeElfHeader(self: *Elf) !void {
     try self.base.file.?.pwriteAll(hdr_buf[0..index], 0);
 }
 
-fn freeTextBlock(self: *Elf, text_block: *TextBlock) void {
+fn freeTextBlock(self: *Elf, index: u32) void {
+    const text_block = &self.managed_text_blocks.items[index];
     var already_have_free_list_node = false;
     {
         var i: usize = 0;
         // TODO turn text_block_free_list into a hash map
         while (i < self.text_block_free_list.items.len) {
-            if (self.text_block_free_list.items[i] == text_block) {
+            if (self.text_block_free_list.items[i] == index) {
                 _ = self.text_block_free_list.swapRemove(i);
                 continue;
             }
@@ -1899,22 +1920,23 @@ fn freeTextBlock(self: *Elf, text_block: *TextBlock) void {
     }
     // TODO process free list for dbg info just like we do above for vaddrs
 
-    if (self.last_text_block == text_block) {
+    if (self.last_text_block == index) {
         // TODO shrink the .text section size here
         self.last_text_block = text_block.prev;
     }
-    if (self.dbg_info_decl_first == text_block) {
+    if (self.dbg_info_decl_first == index) {
         self.dbg_info_decl_first = text_block.dbg_info_next;
     }
-    if (self.dbg_info_decl_last == text_block) {
+    if (self.dbg_info_decl_last == index) {
         // TODO shrink the .debug_info section size here
         self.dbg_info_decl_last = text_block.dbg_info_prev;
     }
 
     if (text_block.prev) |prev| {
-        prev.next = text_block.next;
+        const prev_text_block = &self.managed_text_blocks.items[prev];
+        prev_text_block.next = text_block.next;
 
-        if (!already_have_free_list_node and prev.freeListEligible(self.*)) {
+        if (!already_have_free_list_node and prev_text_block.freeListEligible(self.*)) {
             // The free list is heuristics, it doesn't have to be perfect, so we can
             // ignore the OOM here.
             self.text_block_free_list.append(self.base.allocator, prev) catch {};
@@ -1924,13 +1946,15 @@ fn freeTextBlock(self: *Elf, text_block: *TextBlock) void {
     }
 
     if (text_block.next) |next| {
-        next.prev = text_block.prev;
+        const next_text_block = &self.managed_text_blocks.items[next];
+        next_text_block.prev = text_block.prev;
     } else {
         text_block.next = null;
     }
 
     if (text_block.dbg_info_prev) |prev| {
-        prev.dbg_info_next = text_block.dbg_info_next;
+        const prev_text_block = &self.managed_text_blocks.items[prev];
+        prev_text_block.dbg_info_next = text_block.dbg_info_next;
 
         // TODO the free list logic like we do for text blocks above
     } else {
@@ -1938,39 +1962,42 @@ fn freeTextBlock(self: *Elf, text_block: *TextBlock) void {
     }
 
     if (text_block.dbg_info_next) |next| {
-        next.dbg_info_prev = text_block.dbg_info_prev;
+        const next_text_block = &self.managed_text_blocks.items[next];
+        next_text_block.dbg_info_prev = text_block.dbg_info_prev;
     } else {
         text_block.dbg_info_next = null;
     }
 }
 
-fn shrinkTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64) void {
+fn shrinkTextBlock(self: *Elf, index: u32, new_block_size: u64) void {
     _ = self;
-    _ = text_block;
+    _ = index;
     _ = new_block_size;
     // TODO check the new capacity, and if it crosses the size threshold into a big enough
     // capacity, insert a free list node for it.
 }
 
-fn growTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, alignment: u64) !u64 {
+fn growTextBlock(self: *Elf, index: u32, new_block_size: u64, alignment: u64) !u64 {
+    const text_block = self.managed_text_blocks.items[index];
     const sym = self.local_symbols.items[text_block.local_sym_index];
     const align_ok = mem.alignBackwardGeneric(u64, sym.st_value, alignment) == sym.st_value;
     const need_realloc = !align_ok or new_block_size > text_block.capacity(self.*);
     if (!need_realloc) return sym.st_value;
-    return self.allocateTextBlock(text_block, new_block_size, alignment);
+    return self.allocateTextBlock(index, new_block_size, alignment);
 }
 
-fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, alignment: u64) !u64 {
+fn allocateTextBlock(self: *Elf, text_block_index: u32, new_block_size: u64, alignment: u64) !u64 {
     const phdr = &self.program_headers.items[self.phdr_load_re_index.?];
     const shdr = &self.sections.items[self.text_section_index.?];
     const new_block_ideal_capacity = padToIdeal(new_block_size);
+    const text_block = &self.managed_text_blocks.items[text_block_index];
 
     // We use these to indicate our intention to update metadata, placing the new block,
     // and possibly removing a free list node.
     // It would be simpler to do it inside the for loop below, but that would cause a
     // problem if an error was returned later in the function. So this action
     // is actually carried out at the end of the function, when errors are no longer possible.
-    var block_placement: ?*TextBlock = null;
+    var block_placement: ?u32 = null;
     var free_list_removal: ?usize = null;
 
     // First we look for an appropriately sized free list node.
@@ -1978,7 +2005,8 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
     const vaddr = blk: {
         var i: usize = 0;
         while (i < self.text_block_free_list.items.len) {
-            const big_block = self.text_block_free_list.items[i];
+            const big_block_index = self.text_block_free_list.items[i];
+            const big_block = &self.managed_text_blocks.items[big_block_index];
             // We now have a pointer to a live text block that has too much capacity.
             // Is it enough that we could fit this new text block?
             const sym = self.local_symbols.items[big_block.local_sym_index];
@@ -2006,13 +2034,14 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
             const keep_free_list_node = remaining_capacity >= min_text_capacity;
 
             // Set up the metadata to be updated, after errors are no longer possible.
-            block_placement = big_block;
+            block_placement = big_block_index;
             if (!keep_free_list_node) {
                 free_list_removal = i;
             }
             break :blk new_start_vaddr;
         } else if (self.last_text_block) |last| {
-            const sym = self.local_symbols.items[last.local_sym_index];
+            const last_text_block = self.managed_text_blocks.items[last];
+            const sym = self.local_symbols.items[last_text_block.local_sym_index];
             const ideal_capacity = padToIdeal(sym.st_size);
             const ideal_capacity_end_vaddr = sym.st_value + ideal_capacity;
             const new_start_vaddr = mem.alignForwardGeneric(u64, ideal_capacity_end_vaddr, alignment);
@@ -2024,7 +2053,13 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
         }
     };
 
-    const expand_text_section = block_placement == null or block_placement.?.next == null;
+    const expand_text_section = blk: {
+        if (block_placement) |index| {
+            const block = self.managed_text_blocks.items[index];
+            break :blk block.next == null;
+        }
+        break :blk true;
+    };
     if (expand_text_section) {
         const text_capacity = self.allocatedSize(shdr.sh_offset);
         const needed_size = (vaddr + new_block_size) - phdr.p_vaddr;
@@ -2032,7 +2067,8 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
             // Must move the entire text section.
             const new_offset = self.findFreeSpace(needed_size, 0x1000);
             const text_size = if (self.last_text_block) |last| blk: {
-                const sym = self.local_symbols.items[last.local_sym_index];
+                const last_text_block = self.managed_text_blocks.items[last];
+                const sym = self.local_symbols.items[last_text_block.local_sym_index];
                 break :blk (sym.st_value + sym.st_size) - phdr.p_vaddr;
             } else 0;
             const amt = try self.base.file.?.copyRangeAll(shdr.sh_offset, self.base.file.?, new_offset, text_size);
@@ -2040,7 +2076,7 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
             shdr.sh_offset = new_offset;
             phdr.p_offset = new_offset;
         }
-        self.last_text_block = text_block;
+        self.last_text_block = text_block_index;
 
         shdr.sh_size = needed_size;
         phdr.p_memsz = needed_size;
@@ -2063,16 +2099,19 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
     // In this case we need to "unplug" it from its previous location before
     // plugging it in to its new location.
     if (text_block.prev) |prev| {
-        prev.next = text_block.next;
+        const prev_text_block = &self.managed_text_blocks.items[prev];
+        prev_text_block.next = text_block.next;
     }
     if (text_block.next) |next| {
-        next.prev = text_block.prev;
+        const next_text_block = &self.managed_text_blocks.items[next];
+        next_text_block.prev = text_block.prev;
     }
 
-    if (block_placement) |big_block| {
-        text_block.prev = big_block;
+    if (block_placement) |index| {
+        text_block.prev = index;
+        const big_block = &self.managed_text_blocks.items[index];
         text_block.next = big_block.next;
-        big_block.next = text_block;
+        big_block.next = text_block_index;
     } else {
         text_block.prev = null;
         text_block.next = null;
@@ -2086,31 +2125,43 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
 pub fn allocateDeclIndexes(self: *Elf, decl: *Module.Decl) !void {
     if (self.llvm_object) |_| return;
 
-    if (decl.link.elf.local_sym_index != 0) return;
+    const text_block: *TextBlock = blk: {
+        if (self.decl_text_block_map.get(decl)) |index| {
+            break :blk &self.managed_text_blocks.items[index];
+        }
+
+        const text_block_index = @intCast(u32, self.managed_text_blocks.items.len);
+        const text_block = try self.managed_text_blocks.addOne(self.base.allocator);
+        text_block.* = TextBlock.empty;
+        try self.decl_text_block_map.putNoClobber(self.base.allocator, decl, text_block_index);
+        break :blk text_block;
+    };
+
+    if (text_block.local_sym_index != 0) return;
 
     try self.local_symbols.ensureCapacity(self.base.allocator, self.local_symbols.items.len + 1);
     try self.offset_table.ensureCapacity(self.base.allocator, self.offset_table.items.len + 1);
 
     if (self.local_symbol_free_list.popOrNull()) |i| {
         log.debug("reusing symbol index {d} for {s}", .{ i, decl.name });
-        decl.link.elf.local_sym_index = i;
+        text_block.local_sym_index = i;
     } else {
         log.debug("allocating symbol index {d} for {s}", .{ self.local_symbols.items.len, decl.name });
-        decl.link.elf.local_sym_index = @intCast(u32, self.local_symbols.items.len);
+        text_block.local_sym_index = @intCast(u32, self.local_symbols.items.len);
         _ = self.local_symbols.addOneAssumeCapacity();
     }
 
     if (self.offset_table_free_list.popOrNull()) |i| {
-        decl.link.elf.offset_table_index = i;
+        text_block.offset_table_index = i;
     } else {
-        decl.link.elf.offset_table_index = @intCast(u32, self.offset_table.items.len);
+        text_block.offset_table_index = @intCast(u32, self.offset_table.items.len);
         _ = self.offset_table.addOneAssumeCapacity();
         self.offset_table_count_dirty = true;
     }
 
     const phdr = &self.program_headers.items[self.phdr_load_re_index.?];
 
-    self.local_symbols.items[decl.link.elf.local_sym_index] = .{
+    self.local_symbols.items[text_block.local_sym_index] = .{
         .st_name = 0,
         .st_info = 0,
         .st_other = 0,
@@ -2118,21 +2169,25 @@ pub fn allocateDeclIndexes(self: *Elf, decl: *Module.Decl) !void {
         .st_value = phdr.p_vaddr,
         .st_size = 0,
     };
-    self.offset_table.items[decl.link.elf.offset_table_index] = 0;
+    self.offset_table.items[text_block.offset_table_index] = 0;
 }
 
 pub fn freeDecl(self: *Elf, decl: *Module.Decl) void {
     if (self.llvm_object) |_| return;
 
+    const text_block_index = self.decl_text_block_map.get(decl) orelse return;
+    const text_block = &self.managed_text_blocks.items[text_block_index];
+
+    self.freeTextBlock(text_block_index);
+
     // Appending to free lists is allowed to fail because the free lists are heuristics based anyway.
-    self.freeTextBlock(&decl.link.elf);
-    if (decl.link.elf.local_sym_index != 0) {
-        self.local_symbol_free_list.append(self.base.allocator, decl.link.elf.local_sym_index) catch {};
-        self.offset_table_free_list.append(self.base.allocator, decl.link.elf.offset_table_index) catch {};
+    if (text_block.local_sym_index != 0) {
+        self.local_symbol_free_list.append(self.base.allocator, text_block.local_sym_index) catch {};
+        self.offset_table_free_list.append(self.base.allocator, text_block.offset_table_index) catch {};
 
-        self.local_symbols.items[decl.link.elf.local_sym_index].st_info = 0;
+        self.local_symbols.items[text_block.local_sym_index].st_info = 0;
 
-        decl.link.elf.local_sym_index = 0;
+        text_block.local_sym_index = 0;
     }
     // TODO make this logic match freeTextBlock. Maybe abstract the logic out since the same thing
     // is desired for both.
@@ -2168,24 +2223,27 @@ fn deinitRelocs(gpa: *Allocator, table: *File.DbgInfoTypeRelocsTable) void {
 fn updateDeclCode(self: *Elf, decl: *Module.Decl, code: []const u8, stt_bits: u8) !*elf.Elf64_Sym {
     const required_alignment = decl.ty.abiAlignment(self.base.options.target);
 
-    assert(decl.link.elf.local_sym_index != 0); // Caller forgot to allocateDeclIndexes()
-    const local_sym = &self.local_symbols.items[decl.link.elf.local_sym_index];
+    const text_block_index = self.decl_text_block_map.get(decl) orelse unreachable; // Caller forgot to allocateDeclIndexes()
+    const text_block = &self.managed_text_blocks.items[text_block_index];
+    assert(text_block.local_sym_index != 0); // Caller forgot to allocateDeclIndexes()
+
+    const local_sym = &self.local_symbols.items[text_block.local_sym_index];
     if (local_sym.st_size != 0) {
-        const capacity = decl.link.elf.capacity(self.*);
+        const capacity = text_block.capacity(self.*);
         const need_realloc = code.len > capacity or
             !mem.isAlignedGeneric(u64, local_sym.st_value, required_alignment);
         if (need_realloc) {
-            const vaddr = try self.growTextBlock(&decl.link.elf, code.len, required_alignment);
+            const vaddr = try self.growTextBlock(text_block_index, code.len, required_alignment);
             log.debug("growing {s} from 0x{x} to 0x{x}", .{ decl.name, local_sym.st_value, vaddr });
             if (vaddr != local_sym.st_value) {
                 local_sym.st_value = vaddr;
 
                 log.debug("  (writing new offset table entry)", .{});
-                self.offset_table.items[decl.link.elf.offset_table_index] = vaddr;
-                try self.writeOffsetTableEntry(decl.link.elf.offset_table_index);
+                self.offset_table.items[text_block.offset_table_index] = vaddr;
+                try self.writeOffsetTableEntry(text_block.offset_table_index);
             }
         } else if (code.len < local_sym.st_size) {
-            self.shrinkTextBlock(&decl.link.elf, code.len);
+            self.shrinkTextBlock(text_block_index, code.len);
         }
         local_sym.st_size = code.len;
         local_sym.st_name = try self.updateString(local_sym.st_name, mem.spanZ(decl.name));
@@ -2193,13 +2251,13 @@ fn updateDeclCode(self: *Elf, decl: *Module.Decl, code: []const u8, stt_bits: u8
         local_sym.st_other = 0;
         local_sym.st_shndx = self.text_section_index.?;
         // TODO this write could be avoided if no fields of the symbol were changed.
-        try self.writeSymbol(decl.link.elf.local_sym_index);
+        try self.writeSymbol(text_block.local_sym_index);
     } else {
         const decl_name = mem.spanZ(decl.name);
         const name_str_index = try self.makeString(decl_name);
-        const vaddr = try self.allocateTextBlock(&decl.link.elf, code.len, required_alignment);
+        const vaddr = try self.allocateTextBlock(text_block_index, code.len, required_alignment);
         log.debug("allocated text block for {s} at 0x{x}", .{ decl_name, vaddr });
-        errdefer self.freeTextBlock(&decl.link.elf);
+        errdefer self.freeTextBlock(text_block_index);
 
         local_sym.* = .{
             .st_name = name_str_index,
@@ -2209,10 +2267,10 @@ fn updateDeclCode(self: *Elf, decl: *Module.Decl, code: []const u8, stt_bits: u8
             .st_value = vaddr,
             .st_size = code.len,
         };
-        self.offset_table.items[decl.link.elf.offset_table_index] = vaddr;
+        self.offset_table.items[text_block.offset_table_index] = vaddr;
 
-        try self.writeSymbol(decl.link.elf.local_sym_index);
-        try self.writeOffsetTableEntry(decl.link.elf.offset_table_index);
+        try self.writeSymbol(text_block.local_sym_index);
+        try self.writeOffsetTableEntry(text_block.offset_table_index);
     }
 
     const section_offset = local_sym.st_value - self.program_headers.items[self.phdr_load_re_index.?].p_vaddr;
@@ -2240,8 +2298,9 @@ fn finishUpdateDecl(
         }
     }
 
-    const text_block = &decl.link.elf;
-    try self.updateDeclDebugInfoAllocation(text_block, @intCast(u32, dbg_info_buffer.items.len));
+    const text_block_index = self.decl_text_block_map.get(decl) orelse unreachable;
+    const text_block = &self.managed_text_blocks.items[text_block_index];
+    try self.updateDeclDebugInfoAllocation(text_block_index, @intCast(u32, dbg_info_buffer.items.len));
 
     const target_endian = self.base.options.target.cpu.arch.endian();
 
@@ -2260,7 +2319,7 @@ fn finishUpdateDecl(
         }
     }
 
-    try self.writeDeclDebugInfo(text_block, dbg_info_buffer.items);
+    try self.writeDeclDebugInfo(text_block_index, dbg_info_buffer.items);
 
     // Since we updated the vaddr and the size, each corresponding export symbol also needs to be updated.
     const decl_exports = module.decl_exports.get(decl) orelse &[0]*Module.Export{};
@@ -2602,7 +2661,7 @@ fn addDbgInfoType(self: *Elf, ty: Type, dbg_info_buffer: *std.ArrayList(u8)) !vo
     }
 }
 
-fn updateDeclDebugInfoAllocation(self: *Elf, text_block: *TextBlock, len: u32) !void {
+fn updateDeclDebugInfoAllocation(self: *Elf, text_block_index: u32, len: u32) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -2610,31 +2669,35 @@ fn updateDeclDebugInfoAllocation(self: *Elf, text_block: *TextBlock, len: u32) !
     // `SrcFn` and the line number programs. If you are editing this logic, you
     // probably need to edit that logic too.
 
+    const text_block = &self.managed_text_blocks.items[text_block_index];
     const debug_info_sect = &self.sections.items[self.debug_info_section_index.?];
     text_block.dbg_info_len = len;
     if (self.dbg_info_decl_last) |last| not_first: {
+        const last_block = &self.managed_text_blocks.items[last];
         if (text_block.dbg_info_next) |next| {
+            const next_block = &self.managed_text_blocks.items[next];
             // Update existing Decl - non-last item.
-            if (text_block.dbg_info_off + text_block.dbg_info_len + min_nop_size > next.dbg_info_off) {
+            if (text_block.dbg_info_off + text_block.dbg_info_len + min_nop_size > next_block.dbg_info_off) {
                 // It grew too big, so we move it to a new location.
                 if (text_block.dbg_info_prev) |prev| {
+                    const prev_block = &self.managed_text_blocks.items[prev];
                     self.dbg_info_decl_free_list.put(self.base.allocator, prev, {}) catch {};
-                    prev.dbg_info_next = text_block.dbg_info_next;
+                    prev_block.dbg_info_next = text_block.dbg_info_next;
                 }
-                next.dbg_info_prev = text_block.dbg_info_prev;
+                next_block.dbg_info_prev = text_block.dbg_info_prev;
                 text_block.dbg_info_next = null;
                 // Populate where it used to be with NOPs.
                 const file_pos = debug_info_sect.sh_offset + text_block.dbg_info_off;
                 try self.pwriteDbgInfoNops(0, &[0]u8{}, text_block.dbg_info_len, false, file_pos);
                 // TODO Look at the free list before appending at the end.
                 text_block.dbg_info_prev = last;
-                last.dbg_info_next = text_block;
-                self.dbg_info_decl_last = text_block;
+                last_block.dbg_info_next = text_block_index;
+                self.dbg_info_decl_last = text_block_index;
 
-                text_block.dbg_info_off = last.dbg_info_off + padToIdeal(last.dbg_info_len);
+                text_block.dbg_info_off = last_block.dbg_info_off + padToIdeal(last_block.dbg_info_len);
             }
         } else if (text_block.dbg_info_prev == null) {
-            if (text_block == last) {
+            if (text_block_index == last) {
                 // Special case: there is only 1 .debug_info block and it is being updated.
                 // In this case there is nothing to do. The block's length has
                 // already been updated, and logic in writeDeclDebugInfo takes care of
@@ -2644,21 +2707,21 @@ fn updateDeclDebugInfoAllocation(self: *Elf, text_block: *TextBlock, len: u32) !
             // Append new Decl.
             // TODO Look at the free list before appending at the end.
             text_block.dbg_info_prev = last;
-            last.dbg_info_next = text_block;
-            self.dbg_info_decl_last = text_block;
+            last_block.dbg_info_next = text_block_index;
+            self.dbg_info_decl_last = text_block_index;
 
-            text_block.dbg_info_off = last.dbg_info_off + padToIdeal(last.dbg_info_len);
+            text_block.dbg_info_off = last_block.dbg_info_off + padToIdeal(last_block.dbg_info_len);
         }
     } else {
         // This is the first Decl of the .debug_info
-        self.dbg_info_decl_first = text_block;
-        self.dbg_info_decl_last = text_block;
+        self.dbg_info_decl_first = text_block_index;
+        self.dbg_info_decl_last = text_block_index;
 
         text_block.dbg_info_off = padToIdeal(self.dbgInfoNeededHeaderBytes());
     }
 }
 
-fn writeDeclDebugInfo(self: *Elf, text_block: *TextBlock, dbg_info_buf: []const u8) !void {
+fn writeDeclDebugInfo(self: *Elf, text_block_index: u32, dbg_info_buf: []const u8) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -2666,9 +2729,11 @@ fn writeDeclDebugInfo(self: *Elf, text_block: *TextBlock, dbg_info_buf: []const 
     // `SrcFn` and the line number programs. If you are editing this logic, you
     // probably need to edit that logic too.
 
+    const text_block = &self.managed_text_blocks.items[text_block_index];
     const debug_info_sect = &self.sections.items[self.debug_info_section_index.?];
 
-    const last_decl = self.dbg_info_decl_last.?;
+    const last_decl_index = self.dbg_info_decl_last.?;
+    const last_decl = self.managed_text_blocks.items[last_decl_index];
     // +1 for a trailing zero to end the children of the decl tag.
     const needed_size = last_decl.dbg_info_off + last_decl.dbg_info_len + 1;
     if (needed_size != debug_info_sect.sh_size) {
@@ -2688,14 +2753,15 @@ fn writeDeclDebugInfo(self: *Elf, text_block: *TextBlock, dbg_info_buf: []const 
         self.shdr_table_dirty = true; // TODO look into making only the one section dirty
         self.debug_info_header_dirty = true;
     }
-    const prev_padding_size: u32 = if (text_block.dbg_info_prev) |prev|
-        text_block.dbg_info_off - (prev.dbg_info_off + prev.dbg_info_len)
-    else
-        0;
-    const next_padding_size: u32 = if (text_block.dbg_info_next) |next|
-        next.dbg_info_off - (text_block.dbg_info_off + text_block.dbg_info_len)
-    else
-        0;
+    const prev_padding_size: u32 = if (text_block.dbg_info_prev) |prev| blk: {
+        const prev_block = self.managed_text_blocks.items[prev];
+        break :blk text_block.dbg_info_off - (prev_block.dbg_info_off + prev_block.dbg_info_len);
+    } else 0;
+
+    const next_padding_size: u32 = if (text_block.dbg_info_next) |next| blk: {
+        const next_block = self.managed_text_blocks.items[next];
+        break :blk next_block.dbg_info_off - (text_block.dbg_info_off + text_block.dbg_info_len);
+    } else 0;
 
     // To end the children of the decl tag.
     const trailing_zero = text_block.dbg_info_next == null;
@@ -2718,8 +2784,11 @@ pub fn updateDeclExports(
     defer tracy.end();
 
     try self.global_symbols.ensureCapacity(self.base.allocator, self.global_symbols.items.len + exports.len);
-    if (decl.link.elf.local_sym_index == 0) return;
-    const decl_sym = self.local_symbols.items[decl.link.elf.local_sym_index];
+
+    const text_block_index = self.decl_text_block_map.get(decl) orelse return;
+    const text_block = self.managed_text_blocks.items[text_block_index];
+    if (text_block.local_sym_index == 0) return;
+    const decl_sym = self.local_symbols.items[text_block.local_sym_index];
 
     for (exports) |exp| {
         if (exp.options.section) |section_name| {

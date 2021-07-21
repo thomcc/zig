@@ -140,16 +140,6 @@ pub const File = struct {
     /// of this linking operation.
     lock: ?Cache.Lock = null,
 
-    pub const LinkBlock = union {
-        elf: Elf.TextBlock,
-        coff: Coff.TextBlock,
-        macho: MachO.TextBlock,
-        plan9: Plan9.DeclBlock,
-        c: C.DeclBlock,
-        wasm: Wasm.DeclBlock,
-        spirv: void,
-    };
-
     pub const LinkFn = union {
         elf: Elf.SrcFn,
         coff: Coff.SrcFn,
@@ -533,6 +523,18 @@ pub const File = struct {
             .elf => return @fieldParentPtr(Elf, "base", base).getDeclVAddr(decl),
             .macho => return @fieldParentPtr(MachO, "base", base).getDeclVAddr(decl),
             .plan9 => @panic("GET VADDR"),
+            .c => unreachable,
+            .wasm => unreachable,
+            .spirv => unreachable,
+        }
+    }
+
+    pub fn getDeclOffsetTableVAddr(base: *File, decl: *const Module.Decl, ptr_bytes: u64) u64 {
+        switch (base.tag) {
+            .coff => return @fieldParentPtr(Coff, "base", base).getDeclOffsetTableVAddr(decl, ptr_bytes),
+            .elf => return @fieldParentPtr(Elf, "base", base).getDeclOffsetTableVAddr(decl, ptr_bytes),
+            .macho => return @fieldParentPtr(MachO, "base", base).getDeclOffsetTableVAddr(decl, ptr_bytes),
+            .plan9 => return @fieldParentPtr(Plan9, "base", base).getDeclOffsetTableVAddr(decl, ptr_bytes),
             .c => unreachable,
             .wasm => unreachable,
             .spirv => unreachable,

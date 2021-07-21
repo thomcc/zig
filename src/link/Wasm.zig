@@ -43,7 +43,7 @@ ext_funcs: std.ArrayListUnmanaged(*Module.Decl) = .{},
 /// TODO: Allow setting this through a flag?
 host_name: []const u8 = "env",
 /// The last `DeclBlock` that was initialized will be saved here.
-last_block: ?*DeclBlock = null,
+last_block: ?u32 = null,
 /// Table with offsets, each element represents an offset with the value being
 /// the offset into the 'data' section where the data lives
 offset_table: std.ArrayListUnmanaged(u32) = .{},
@@ -54,6 +54,9 @@ offset_table_free_list: std.ArrayListUnmanaged(u32) = .{},
 /// This is ment for bookkeeping so we can safely cleanup all codegen memory
 /// when calling `deinit`
 symbols: std.ArrayListUnmanaged(*Module.Decl) = .{},
+
+managed_decl_blocks: std.ArrayListUnmanaged(DeclBlock) = .{},
+decl_block_map: std.AutoHashMapUnmanaged(*const Module.Decl, u32) = .{},
 
 pub const FnData = struct {
     /// Generated code for the type of the function
@@ -83,8 +86,8 @@ pub const DeclBlock = struct {
     size: u32,
     /// Points to the previous and next blocks.
     /// Can be used to find the total size, and used to calculate the `offset` based on the previous block.
-    prev: ?*DeclBlock,
-    next: ?*DeclBlock,
+    prev: ?u32,
+    next: ?u32,
     /// Pointer to data that will be written to the 'data' section.
     /// This data either lives in `FnData.code` or is externally managed.
     /// For data that does not live inside the 'data' section, this field will be undefined. (size == 0).
@@ -101,13 +104,15 @@ pub const DeclBlock = struct {
     };
 
     /// Unplugs the `DeclBlock` from the chain
-    fn unplug(self: *DeclBlock) void {
+    fn unplug(self: *DeclBlock, wasm_file: *Wasm) void {
         if (self.prev) |prev| {
-            prev.next = self.next;
+            const prev_block = &wasm_file.managed_decl_blocks.items[prev];
+            prev_block.next = self.next;
         }
 
         if (self.next) |next| {
-            next.prev = self.prev;
+            const next_block = &wasm_file.managed_decl_blocks.items[next];
+            next_block.prev = self.prev;
         }
         self.next = null;
         self.prev = null;
@@ -164,15 +169,29 @@ pub fn deinit(self: *Wasm) void {
     self.offset_table.deinit(self.base.allocator);
     self.offset_table_free_list.deinit(self.base.allocator);
     self.symbols.deinit(self.base.allocator);
+
+    self.managed_decl_blocks.deinit(self.base.allocator);
+    self.decl_block_map.deinit(self.base.allocator);
 }
 
 pub fn allocateDeclIndexes(self: *Wasm, decl: *Module.Decl) !void {
-    if (decl.link.wasm.init) return;
+    const block: *DeclBlock = blk: {
+        if (self.decl_block_map.get(decl)) |index| {
+            break :blk &self.managed_decl_blocks.items[index];
+        }
+
+        const block_index = @intCast(u32, self.managed_decl_blocks.items.len);
+        const block = try self.managed_decl_blocks.addOne(self.base.allocator);
+        block.* = DeclBlock.empty;
+        try self.decl_block_map.putNoClobber(self.base.allocator, decl, block_index);
+        break :blk block;
+    };
+
+    if (block.init) return;
 
     try self.offset_table.ensureCapacity(self.base.allocator, self.offset_table.items.len + 1);
     try self.symbols.ensureCapacity(self.base.allocator, self.symbols.items.len + 1);
 
-    const block = &decl.link.wasm;
     block.init = true;
 
     block.symbol_index = @intCast(u32, self.symbols.items.len);
@@ -205,7 +224,10 @@ pub fn updateFunc(self: *Wasm, module: *Module, func: *Module.Fn, air: Air, live
         if (self.llvm_object) |llvm_object| return llvm_object.updateFunc(module, func, air, liveness);
     }
     const decl = func.owner_decl;
-    assert(decl.link.wasm.init); // Must call allocateDeclIndexes()
+
+    const block_index = self.decl_block_map.get(decl) orelse unreachable; // Must call allocateDeclIndexes()
+    const block = &self.managed_decl_blocks.items[block_index];
+    assert(block.init); // Must call allocateDeclIndexes()
 
     const fn_data = &decl.fn_link.wasm;
     fn_data.functype.items.len = 0;
@@ -213,7 +235,7 @@ pub fn updateFunc(self: *Wasm, module: *Module, func: *Module.Fn, air: Air, live
     fn_data.idx_refs.items.len = 0;
 
     var context = codegen.Context{
-        .gpa = self.base.allocator,
+        .wasm_file = self,
         .air = air,
         .liveness = liveness,
         .values = .{},
@@ -248,7 +270,10 @@ pub fn updateDecl(self: *Wasm, module: *Module, decl: *Module.Decl) !void {
     if (build_options.have_llvm) {
         if (self.llvm_object) |llvm_object| return llvm_object.updateDecl(module, decl);
     }
-    assert(decl.link.wasm.init); // Must call allocateDeclIndexes()
+
+    const block_index = self.decl_block_map.get(decl) orelse unreachable; // Must call allocateDeclIndexes()
+    const block = self.managed_decl_blocks.items[block_index];
+    assert(block.init); // Must call allocateDeclIndexes()
 
     // TODO don't use this for non-functions
     const fn_data = &decl.fn_link.wasm;
@@ -257,7 +282,7 @@ pub fn updateDecl(self: *Wasm, module: *Module, decl: *Module.Decl) !void {
     fn_data.idx_refs.items.len = 0;
 
     var context = codegen.Context{
-        .gpa = self.base.allocator,
+        .wasm_file = self,
         .air = undefined,
         .liveness = undefined,
         .values = .{},
@@ -295,7 +320,9 @@ fn finishUpdateDecl(self: *Wasm, decl: *Module.Decl, result: codegen.Result, con
         .externally_managed => |payload| payload,
     };
 
-    const block = &decl.link.wasm;
+    const block_index = self.decl_block_map.get(decl) orelse unreachable;
+    const block = &self.managed_decl_blocks.items[block_index];
+
     if (decl.ty.zigTypeTag() == .Fn) {
         // as locals are patched afterwards, the offsets of funcidx's are off,
         // here we update them to correct them
@@ -310,15 +337,16 @@ fn finishUpdateDecl(self: *Wasm, decl: *Module.Decl, result: codegen.Result, con
 
     // If we're updating an existing decl, unplug it first
     // to avoid infinite loops due to earlier links
-    block.unplug();
+    block.unplug(self);
 
     if (self.last_block) |last| {
-        if (last != block) {
-            last.next = block;
+        if (last != block_index) {
+            const last_block = &self.managed_decl_blocks.items[last];
+            last_block.next = block_index;
             block.prev = last;
         }
     }
-    self.last_block = block;
+    self.last_block = block_index;
 }
 
 pub fn updateDeclExports(
@@ -341,20 +369,26 @@ pub fn freeDecl(self: *Wasm, decl: *Module.Decl) void {
             else => unreachable,
         }
     }
-    const block = &decl.link.wasm;
 
-    if (self.last_block == block) {
+    const block_index = self.decl_block_map.get(decl) orelse return;
+    const block = &self.managed_decl_blocks.items[block_index];
+
+    if (self.last_block == block_index) {
         self.last_block = block.prev;
     }
 
-    block.unplug();
+    block.unplug(self);
 
-    self.offset_table_free_list.append(self.base.allocator, decl.link.wasm.offset_index) catch {};
+    self.offset_table_free_list.append(self.base.allocator, block.offset_index) catch {};
     _ = self.symbols.swapRemove(block.symbol_index);
 
     // update symbol_index as we swap removed the last symbol into the removed's position
-    if (block.symbol_index < self.symbols.items.len)
-        self.symbols.items[block.symbol_index].link.wasm.symbol_index = block.symbol_index;
+    if (block.symbol_index < self.symbols.items.len) {
+        const other_decl = self.symbols.items[block.symbol_index];
+        const other_block_index = self.decl_block_map.get(other_decl) orelse unreachable;
+        const other_block = &self.managed_decl_blocks.items[other_block_index];
+        other_block.symbol_index = block.symbol_index;
+    }
 
     block.init = false;
 
@@ -388,13 +422,18 @@ pub fn flushModule(self: *Wasm, comp: *Compilation) !void {
 
     // The size of the data, this together with `offset_table_size` amounts to the
     // total size of the 'data' section
-    var first_decl: ?*DeclBlock = null;
+    var first_decl: ?u32 = null;
     const data_size: u32 = if (self.last_block) |last| blk: {
-        var size = last.size;
-        var cur = last;
-        while (cur.prev) |prev| : (cur = prev) {
-            size += prev.size;
+        const last_block = self.managed_decl_blocks.items[last];
+        var size = last_block.size;
+
+        var cur: ?u32 = last;
+        while (cur) |cur_index| {
+            const cur_block = self.managed_decl_blocks.items[cur_index];
+            size += cur_block.size;
+            cur = cur_block.prev;
         }
+
         first_decl = cur;
         break :blk size;
     } else 0;
@@ -587,8 +626,13 @@ pub fn flushModule(self: *Wasm, comp: *Compilation) !void {
         const file_offset = try file.getPos();
         var cur = first_decl;
         var data_offset = offset_table_size;
-        while (cur) |cur_block| : (cur = cur_block.next) {
-            if (cur_block.size == 0) continue;
+
+        while (cur) |cur_index| {
+            const cur_block = self.managed_decl_blocks.items[cur_index];
+            if (cur_block.size == 0) {
+                cur = cur_block.next;
+                continue;
+            }
             assert(cur_block.init);
 
             const offset = (cur_block.offset_index) * ptr_width;
@@ -598,6 +642,8 @@ pub fn flushModule(self: *Wasm, comp: *Compilation) !void {
             try file.pwriteAll(&buf, file_offset + offset);
             try file.pwriteAll(cur_block.data[0..cur_block.size], file_offset + data_offset);
             data_offset += cur_block.size;
+
+            cur = cur_block.next;
         }
 
         try file.seekTo(file_offset + data_offset);
@@ -943,4 +989,10 @@ fn writeVecSectionHeader(file: fs.File, offset: u64, section: wasm.Section, size
     leb.writeUnsignedFixed(5, buf[1..6], size);
     leb.writeUnsignedFixed(5, buf[6..], items);
     try file.pwriteAll(&buf, offset);
+}
+
+pub fn getDeclOffsetTableVAddr(self: *Wasm, decl: *const Module.Decl, ptr_bytes: u64) u64 {
+    const block_index = self.decl_block_map.get(decl) orelse unreachable;
+    const block = self.managed_decl_blocks.items[block_index];
+    return block.offset_index * ptr_bytes;
 }

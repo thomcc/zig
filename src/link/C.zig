@@ -23,6 +23,9 @@ base: link.File,
 /// in the flush function, stitching pre-rendered pieces of C code together.
 decl_table: std.AutoArrayHashMapUnmanaged(*Module.Decl, void) = .{},
 
+managed_decl_blocks: std.ArrayListUnmanaged(DeclBlock) = .{},
+decl_block_map: std.AutoHashMapUnmanaged(*const Module.Decl, u32) = .{},
+
 /// Per-declaration data. For functions this is the body, and
 /// the forward declaration is stored in the FnBlock.
 pub const DeclBlock = struct {
@@ -74,23 +77,33 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
 
 pub fn deinit(self: *C) void {
     for (self.decl_table.keys()) |key| {
-        deinitDecl(self.base.allocator, key);
+        self.deinitDecl(self.base.allocator, key);
     }
     self.decl_table.deinit(self.base.allocator);
+
+    self.managed_decl_blocks.deinit(self.base.allocator);
+    self.decl_block_map.deinit(self.base.allocator);
 }
 
 pub fn allocateDeclIndexes(self: *C, decl: *Module.Decl) !void {
-    _ = self;
-    _ = decl;
+    if (self.decl_block_map.contains(decl)) return;
+    const block_index = @intCast(u32, self.managed_decl_blocks.items.len);
+    const block = try self.managed_decl_blocks.addOne(self.base.allocator);
+    block.* = DeclBlock.empty;
+    try self.decl_block_map.putNoClobber(self.base.allocator, decl, block_index);
 }
 
 pub fn freeDecl(self: *C, decl: *Module.Decl) void {
     _ = self.decl_table.swapRemove(decl);
-    deinitDecl(self.base.allocator, decl);
+    self.deinitDecl(self.base.allocator, decl);
 }
 
-fn deinitDecl(gpa: *Allocator, decl: *Module.Decl) void {
-    decl.link.c.code.deinit(gpa);
+fn deinitDecl(self: *C, gpa: *Allocator, decl: *Module.Decl) void {
+    if (self.decl_block_map.get(decl)) |index| {
+        const block = &self.managed_decl_blocks.items[index];
+        block.code.deinit(self.base.allocator);
+    }
+
     decl.fn_link.c.fwd_decl.deinit(gpa);
     for (decl.fn_link.c.typedefs.values()) |value| {
         gpa.free(value.rendered);
@@ -102,9 +115,14 @@ pub fn finishUpdateDecl(self: *C, module: *Module, decl: *Module.Decl, air: Air,
     // Keep track of all decls so we can iterate over them on flush().
     _ = try self.decl_table.getOrPut(self.base.allocator, decl);
 
+    const block = blk: {
+        const index = self.decl_block_map.get(decl) orelse unreachable;
+        break :blk &self.managed_decl_blocks.items[index];
+    };
+
     const fwd_decl = &decl.fn_link.c.fwd_decl;
     const typedefs = &decl.fn_link.c.typedefs;
-    const code = &decl.link.c.code;
+    const code = &block.code;
     fwd_decl.shrinkRetainingCapacity(0);
     {
         for (typedefs.values()) |value| {
@@ -241,7 +259,9 @@ pub fn flushModule(self: *C, comp: *Compilation) !void {
                 fn_count += 1;
                 break :buf decl.fn_link.c.fwd_decl.items;
             } else {
-                break :buf decl.link.c.code.items;
+                const index = self.decl_block_map.get(decl) orelse unreachable;
+                const block = self.managed_decl_blocks.items[index];
+                break :buf block.code.items;
             }
         };
         all_buffers.appendAssumeCapacity(.{
@@ -262,7 +282,9 @@ pub fn flushModule(self: *C, comp: *Compilation) !void {
     for (self.decl_table.keys()) |decl| {
         if (!decl.has_tv) continue;
         if (decl.val.castTag(.function)) |_| {
-            const buf = decl.link.c.code.items;
+            const index = self.decl_block_map.get(decl) orelse unreachable;
+            const block = self.managed_decl_blocks.items[index];
+            const buf = block.code.items;
             all_buffers.appendAssumeCapacity(.{
                 .iov_base = buf.ptr,
                 .iov_len = buf.len,

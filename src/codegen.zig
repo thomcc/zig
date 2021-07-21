@@ -2373,18 +2373,12 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
 
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-                                const got_addr = if (self.bin_file.cast(link.File.Elf)) |elf_file| blk: {
-                                    const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-                                    break :blk @intCast(u32, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * ptr_bytes);
-                                } else if (self.bin_file.cast(link.File.Coff)) |coff_file|
-                                    @intCast(u32, coff_file.offset_table_virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes)
-                                else
-                                    unreachable;
+                                const got_addr = self.bin_file.getDeclOffsetTableVAddr(func.owner_decl, ptr_bytes);
 
                                 // ff 14 25 xx xx xx xx    call [addr]
                                 try self.code.ensureCapacity(self.code.items.len + 7);
                                 self.code.appendSliceAssumeCapacity(&[3]u8{ 0xff, 0x14, 0x25 });
-                                mem.writeIntLittle(u32, self.code.addManyAsArrayAssumeCapacity(4), got_addr);
+                                mem.writeIntLittle(u32, self.code.addManyAsArrayAssumeCapacity(4), @intCast(u32, got_addr));
                             } else if (func_value.castTag(.extern_fn)) |_| {
                                 return self.fail("TODO implement calling extern functions", .{});
                             } else {
@@ -2403,13 +2397,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
 
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-                                const got_addr = if (self.bin_file.cast(link.File.Elf)) |elf_file| blk: {
-                                    const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-                                    break :blk @intCast(u32, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * ptr_bytes);
-                                } else if (self.bin_file.cast(link.File.Coff)) |coff_file|
-                                    coff_file.offset_table_virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes
-                                else
-                                    unreachable;
+                                const got_addr = self.bin_file.getDeclOffsetTableVAddr(func.owner_decl, ptr_bytes);
 
                                 try self.genSetReg(Type.initTag(.usize), .ra, .{ .memory = got_addr });
                                 mem.writeIntLittle(u32, try self.code.addManyAsArray(4), Instruction.jalr(.ra, 0, .ra).toU32());
@@ -2459,13 +2447,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                 const func = func_payload.data;
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-                                const got_addr = if (self.bin_file.cast(link.File.Elf)) |elf_file| blk: {
-                                    const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-                                    break :blk @intCast(u32, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * ptr_bytes);
-                                } else if (self.bin_file.cast(link.File.Coff)) |coff_file|
-                                    coff_file.offset_table_virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes
-                                else
-                                    unreachable;
+                                const got_addr = self.bin_file.getDeclOffsetTableVAddr(func.owner_decl, ptr_bytes);
 
                                 try self.genSetReg(Type.initTag(.usize), .lr, .{ .memory = got_addr });
 
@@ -2523,13 +2505,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                 const func = func_payload.data;
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-                                const got_addr = if (self.bin_file.cast(link.File.Elf)) |elf_file| blk: {
-                                    const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-                                    break :blk @intCast(u32, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * ptr_bytes);
-                                } else if (self.bin_file.cast(link.File.Coff)) |coff_file|
-                                    coff_file.offset_table_virtual_address + func.owner_decl.link.coff.offset_table_index * ptr_bytes
-                                else
-                                    unreachable;
+                                const got_addr = self.bin_file.getDeclOffsetTableVAddr(func.owner_decl, ptr_bytes);
 
                                 try self.genSetReg(Type.initTag(.usize), .x30, .{ .memory = got_addr });
 
@@ -2587,11 +2563,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 if (self.air.value(callee)) |func_value| {
                     if (func_value.castTag(.function)) |func_payload| {
                         const func = func_payload.data;
-                        const got_addr = blk: {
-                            const seg = macho_file.load_commands.items[macho_file.data_const_segment_cmd_index.?].Segment;
-                            const got = seg.sections.items[macho_file.got_section_index.?];
-                            break :blk got.addr + func.owner_decl.link.macho.offset_table_index * @sizeOf(u64);
-                        };
+                        const got_addr = self.bin_file.getDeclOffsetTableVAddr(func.owner_decl, @sizeOf(u64));
                         log.debug("got_addr = 0x{x}", .{got_addr});
                         switch (arch) {
                             .x86_64 => {
@@ -2646,7 +2618,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 } else {
                     return self.fail("TODO implement calling runtime known function pointer", .{});
                 }
-            } else if (self.bin_file.cast(link.File.Plan9)) |p9| {
+            } else if (self.bin_file.cast(link.File.Plan9)) |_| {
                 switch (arch) {
                     .x86_64 => {
                         for (info.args) |mc_arg, arg_i| {
@@ -2684,15 +2656,14 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                         }
                         if (self.air.value(callee)) |func_value| {
                             if (func_value.castTag(.function)) |func_payload| {
+                                const func = func_payload.data;
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-                                const got_addr = p9.bases.data;
-                                const got_index = func_payload.data.owner_decl.link.plan9.got_index.?;
+                                const got_addr = self.bin_file.getDeclOffsetTableVAddr(func.owner_decl, ptr_bytes);
                                 // ff 14 25 xx xx xx xx    call [addr]
                                 try self.code.ensureCapacity(self.code.items.len + 7);
                                 self.code.appendSliceAssumeCapacity(&[3]u8{ 0xff, 0x14, 0x25 });
-                                const fn_got_addr = got_addr + got_index * ptr_bytes;
-                                mem.writeIntLittle(u32, self.code.addManyAsArrayAssumeCapacity(4), @intCast(u32, fn_got_addr));
+                                mem.writeIntLittle(u32, self.code.addManyAsArrayAssumeCapacity(4), @intCast(u32, got_addr));
                             } else return self.fail("TODO implement calling extern fn on plan9", .{});
                         } else {
                             return self.fail("TODO implement calling runtime known function pointer", .{});
@@ -2731,13 +2702,12 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                         }
                         if (self.air.value(callee)) |func_value| {
                             if (func_value.castTag(.function)) |func_payload| {
+                                const func = func_payload.data;
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-                                const got_addr = p9.bases.data;
-                                const got_index = func_payload.data.owner_decl.link.plan9.got_index.?;
-                                const fn_got_addr = got_addr + got_index * ptr_bytes;
+                                const got_addr = self.bin_file.getDeclOffsetTableVAddr(func.owner_decl, ptr_bytes);
 
-                                try self.genSetReg(Type.initTag(.usize), .x30, .{ .memory = fn_got_addr });
+                                try self.genSetReg(Type.initTag(.usize), .x30, .{ .memory = got_addr });
 
                                 writeInt(u32, try self.code.addManyAsArray(4), Instruction.blr(.x30).toU32());
                             } else if (func_value.castTag(.extern_fn)) |_| {
@@ -4637,30 +4607,14 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                     },
                     else => {
                         if (typed_value.val.castTag(.decl_ref)) |payload| {
-                            if (self.bin_file.cast(link.File.Elf)) |elf_file| {
-                                const decl = payload.data;
-                                const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-                                const got_addr = got.p_vaddr + decl.link.elf.offset_table_index * ptr_bytes;
-                                return MCValue{ .memory = got_addr };
-                            } else if (self.bin_file.cast(link.File.MachO)) |macho_file| {
-                                const decl = payload.data;
-                                const got_addr = blk: {
-                                    const seg = macho_file.load_commands.items[macho_file.data_const_segment_cmd_index.?].Segment;
-                                    const got = seg.sections.items[macho_file.got_section_index.?];
-                                    break :blk got.addr + decl.link.macho.offset_table_index * ptr_bytes;
-                                };
-                                return MCValue{ .memory = got_addr };
-                            } else if (self.bin_file.cast(link.File.Coff)) |coff_file| {
-                                const decl = payload.data;
-                                const got_addr = coff_file.offset_table_virtual_address + decl.link.coff.offset_table_index * ptr_bytes;
-                                return MCValue{ .memory = got_addr };
-                            } else if (self.bin_file.cast(link.File.Plan9)) |p9| {
-                                const decl = payload.data;
-                                const got_addr = p9.bases.data + decl.link.plan9.got_index.? * ptr_bytes;
-                                return MCValue{ .memory = got_addr };
-                            } else {
-                                return self.fail("TODO codegen non-ELF const Decl pointer", .{});
-                            }
+                            const memory = switch (self.bin_file.tag) {
+                                .elf, .macho, .coff, .plan9 => self.bin_file.getDeclOffsetTableVAddr(
+                                    payload.data,
+                                    ptr_bytes,
+                                ),
+                                else => return self.fail("TODO codegen non-ELF const Decl pointer", .{}),
+                            };
+                            return MCValue{ .memory = memory };
                         }
                         if (typed_value.val.tag() == .int_u64) {
                             return MCValue{ .immediate = typed_value.val.toUnsignedInt() };

@@ -17,7 +17,6 @@ const Type = @import("../../type.zig").Type;
 const link = @import("../../link.zig");
 const MachO = @import("../MachO.zig");
 const SrcFn = MachO.SrcFn;
-const TextBlock = MachO.TextBlock;
 const padToIdeal = MachO.padToIdeal;
 
 usingnamespace @import("commands.zig");
@@ -71,9 +70,9 @@ dbg_line_fn_last: ?*SrcFn = null,
 
 /// A list of `TextBlock` whose corresponding .debug_info tags have surplus capacity.
 /// This is the same concept as `text_block_free_list`; see those doc comments.
-dbg_info_decl_free_list: std.AutoHashMapUnmanaged(*TextBlock, void) = .{},
-dbg_info_decl_first: ?*TextBlock = null,
-dbg_info_decl_last: ?*TextBlock = null,
+dbg_info_decl_free_list: std.AutoHashMapUnmanaged(u32, void) = .{},
+dbg_info_decl_first: ?u32 = null,
+dbg_info_decl_last: ?u32 = null,
 
 /// Table of debug symbol names aka the debug string table.
 debug_string_table: std.ArrayListUnmanaged(u8) = .{},
@@ -394,7 +393,9 @@ pub fn flushModule(self: *DebugSymbols, allocator: *Allocator, options: link.Opt
         // If this value is null it means there is an error in the module;
         // leave debug_info_header_dirty=true.
         const first_dbg_info_decl = self.dbg_info_decl_first orelse break :debug_info;
+        const first_dbg_info_decl_block = self.base.managed_text_blocks.items[first_dbg_info_decl];
         const last_dbg_info_decl = self.dbg_info_decl_last.?;
+        const last_dbg_info_decl_block = self.base.managed_text_blocks.items[last_dbg_info_decl];
         const dwarf_segment = &self.load_commands.items[self.dwarf_segment_cmd_index.?].Segment;
         const debug_info_sect = &dwarf_segment.sections.items[self.debug_info_section_index.?];
 
@@ -410,7 +411,7 @@ pub fn flushModule(self: *DebugSymbols, allocator: *Allocator, options: link.Opt
         // We have to come back and write it later after we know the size.
         const after_init_len = di_buf.items.len + init_len_size;
         // +1 for the final 0 that ends the compilation unit children.
-        const dbg_info_end = last_dbg_info_decl.dbg_info_off + last_dbg_info_decl.dbg_info_len + 1;
+        const dbg_info_end = last_dbg_info_decl_block.dbg_info_off + last_dbg_info_decl_block.dbg_info_len + 1;
         const init_len = dbg_info_end - after_init_len;
         mem.writeIntLittle(u32, di_buf.addManyAsArrayAssumeCapacity(4), @intCast(u32, init_len));
         mem.writeIntLittle(u16, di_buf.addManyAsArrayAssumeCapacity(2), 4); // DWARF version
@@ -440,11 +441,11 @@ pub fn flushModule(self: *DebugSymbols, allocator: *Allocator, options: link.Opt
         // Until then we say it is C99.
         mem.writeIntLittle(u16, di_buf.addManyAsArrayAssumeCapacity(2), DW.LANG_C99);
 
-        if (di_buf.items.len > first_dbg_info_decl.dbg_info_off) {
+        if (di_buf.items.len > first_dbg_info_decl_block.dbg_info_off) {
             // Move the first N decls to the end to make more padding for the header.
             @panic("TODO: handle __debug_info header exceeding its padding");
         }
-        const jmp_amt = first_dbg_info_decl.dbg_info_off - di_buf.items.len;
+        const jmp_amt = first_dbg_info_decl_block.dbg_info_off - di_buf.items.len;
         try self.pwriteDbgInfoNops(0, di_buf.items, jmp_amt, false, debug_info_sect.offset);
         self.debug_info_header_dirty = false;
     }
@@ -980,8 +981,9 @@ pub fn commitDeclDebugInfo(
     var dbg_info_buffer = &debug_buffers.dbg_info_buffer;
     var dbg_info_type_relocs = &debug_buffers.dbg_info_type_relocs;
 
-    const symbol = self.base.locals.items[decl.link.macho.local_sym_index];
-    const text_block = &decl.link.macho;
+    const text_block_index = self.base.decl_text_block_map.get(decl) orelse unreachable;
+    const text_block = &self.base.managed_text_blocks.items[text_block_index];
+    const symbol = self.base.locals.items[text_block.local_sym_index];
     // If the Decl is a function, we need to update the __debug_line program.
     assert(decl.has_tv);
     switch (decl.ty.zigTypeTag()) {
@@ -1113,7 +1115,7 @@ pub fn commitDeclDebugInfo(
         }
     }
 
-    try self.updateDeclDebugInfoAllocation(allocator, text_block, @intCast(u32, dbg_info_buffer.items.len));
+    try self.updateDeclDebugInfoAllocation(allocator, text_block_index, @intCast(u32, dbg_info_buffer.items.len));
 
     {
         // Now that we have the offset assigned we can finally perform type relocations.
@@ -1129,7 +1131,7 @@ pub fn commitDeclDebugInfo(
         }
     }
 
-    try self.writeDeclDebugInfo(text_block, dbg_info_buffer.items);
+    try self.writeDeclDebugInfo(text_block_index, dbg_info_buffer.items);
 }
 
 /// Asserts the type has codegen bits.
@@ -1179,7 +1181,7 @@ fn addDbgInfoType(
 fn updateDeclDebugInfoAllocation(
     self: *DebugSymbols,
     allocator: *Allocator,
-    text_block: *TextBlock,
+    text_block_index: u32,
     len: u32,
 ) !void {
     const tracy = trace(@src());
@@ -1191,48 +1193,54 @@ fn updateDeclDebugInfoAllocation(
 
     const dwarf_segment = &self.load_commands.items[self.dwarf_segment_cmd_index.?].Segment;
     const debug_info_sect = &dwarf_segment.sections.items[self.debug_info_section_index.?];
+    const text_block = &self.base.managed_text_blocks.items[text_block_index];
     text_block.dbg_info_len = len;
+
     if (self.dbg_info_decl_last) |last| blk: {
-        if (text_block == last) break :blk;
+        if (text_block_index == last) break :blk;
+        const last_block = &self.base.managed_text_blocks.items[last];
+
         if (text_block.dbg_info_next) |next| {
+            const next_block = &self.base.managed_text_blocks.items[next];
             // Update existing Decl - non-last item.
-            if (text_block.dbg_info_off + text_block.dbg_info_len + min_nop_size > next.dbg_info_off) {
+            if (text_block.dbg_info_off + text_block.dbg_info_len + min_nop_size > next_block.dbg_info_off) {
                 // It grew too big, so we move it to a new location.
                 if (text_block.dbg_info_prev) |prev| {
+                    const prev_block = &self.base.managed_text_blocks.items[prev];
                     self.dbg_info_decl_free_list.put(allocator, prev, {}) catch {};
-                    prev.dbg_info_next = text_block.dbg_info_next;
+                    prev_block.dbg_info_next = text_block.dbg_info_next;
                 }
-                next.dbg_info_prev = text_block.dbg_info_prev;
+                next_block.dbg_info_prev = text_block.dbg_info_prev;
                 text_block.dbg_info_next = null;
                 // Populate where it used to be with NOPs.
                 const file_pos = debug_info_sect.offset + text_block.dbg_info_off;
                 try self.pwriteDbgInfoNops(0, &[0]u8{}, text_block.dbg_info_len, false, file_pos);
                 // TODO Look at the free list before appending at the end.
                 text_block.dbg_info_prev = last;
-                last.dbg_info_next = text_block;
-                self.dbg_info_decl_last = text_block;
+                last_block.dbg_info_next = text_block_index;
+                self.dbg_info_decl_last = text_block_index;
 
-                text_block.dbg_info_off = last.dbg_info_off + padToIdeal(last.dbg_info_len);
+                text_block.dbg_info_off = last_block.dbg_info_off + padToIdeal(last_block.dbg_info_len);
             }
         } else if (text_block.dbg_info_prev == null) {
             // Append new Decl.
             // TODO Look at the free list before appending at the end.
             text_block.dbg_info_prev = last;
-            last.dbg_info_next = text_block;
-            self.dbg_info_decl_last = text_block;
+            last_block.dbg_info_next = text_block_index;
+            self.dbg_info_decl_last = text_block_index;
 
-            text_block.dbg_info_off = last.dbg_info_off + padToIdeal(last.dbg_info_len);
+            text_block.dbg_info_off = last_block.dbg_info_off + padToIdeal(last_block.dbg_info_len);
         }
     } else {
         // This is the first Decl of the .debug_info
-        self.dbg_info_decl_first = text_block;
-        self.dbg_info_decl_last = text_block;
+        self.dbg_info_decl_first = text_block_index;
+        self.dbg_info_decl_last = text_block_index;
 
         text_block.dbg_info_off = padToIdeal(self.dbgInfoNeededHeaderBytes());
     }
 }
 
-fn writeDeclDebugInfo(self: *DebugSymbols, text_block: *TextBlock, dbg_info_buf: []const u8) !void {
+fn writeDeclDebugInfo(self: *DebugSymbols, text_block_index: u32, dbg_info_buf: []const u8) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -1240,16 +1248,18 @@ fn writeDeclDebugInfo(self: *DebugSymbols, text_block: *TextBlock, dbg_info_buf:
     // `SrcFn` and the line number programs. If you are editing this logic, you
     // probably need to edit that logic too.
 
+    const text_block = &self.base.managed_text_blocks.items[text_block_index];
     const dwarf_segment = &self.load_commands.items[self.dwarf_segment_cmd_index.?].Segment;
     const debug_info_sect = &dwarf_segment.sections.items[self.debug_info_section_index.?];
 
     const last_decl = self.dbg_info_decl_last.?;
+    const last_decl_block = self.base.managed_text_blocks.items[last_decl];
     // +1 for a trailing zero to end the children of the decl tag.
-    const needed_size = last_decl.dbg_info_off + last_decl.dbg_info_len + 1;
+    const needed_size = last_decl_block.dbg_info_off + last_decl_block.dbg_info_len + 1;
     if (needed_size != debug_info_sect.size) {
         if (needed_size > dwarf_segment.allocatedSize(debug_info_sect.offset)) {
             const new_offset = dwarf_segment.findFreeSpace(needed_size, 1, null);
-            const existing_size = last_decl.dbg_info_off;
+            const existing_size = last_decl_block.dbg_info_off;
 
             log.debug("moving __debug_info section: {} bytes from 0x{x} to 0x{x}", .{
                 existing_size,
@@ -1266,14 +1276,14 @@ fn writeDeclDebugInfo(self: *DebugSymbols, text_block: *TextBlock, dbg_info_buf:
         self.load_commands_dirty = true; // TODO look into making only the one section dirty
         self.debug_info_header_dirty = true;
     }
-    const prev_padding_size: u32 = if (text_block.dbg_info_prev) |prev|
-        text_block.dbg_info_off - (prev.dbg_info_off + prev.dbg_info_len)
-    else
-        0;
-    const next_padding_size: u32 = if (text_block.dbg_info_next) |next|
-        next.dbg_info_off - (text_block.dbg_info_off + text_block.dbg_info_len)
-    else
-        0;
+    const prev_padding_size: u32 = if (text_block.dbg_info_prev) |prev| blk: {
+        const prev_block = self.base.managed_text_blocks.items[prev];
+        break :blk text_block.dbg_info_off - (prev_block.dbg_info_off + prev_block.dbg_info_len);
+    } else 0;
+    const next_padding_size: u32 = if (text_block.dbg_info_next) |next| blk: {
+        const next_block = self.base.managed_text_blocks.items[next];
+        break :blk next_block.dbg_info_off - (text_block.dbg_info_off + text_block.dbg_info_len);
+    } else 0;
 
     // To end the children of the decl tag.
     const trailing_zero = text_block.dbg_info_next == null;
